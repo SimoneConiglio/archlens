@@ -27,6 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-confidence", type=float, default=0.0, metavar="X",
                    help="drop pattern matches below this confidence (0-1)")
     p.add_argument("--json", action="store_true", help="print the analysed model as JSON to stdout instead of writing HTML")
+    p.add_argument("--no-export", action="store_true",
+                   help="hide the 'Download SVG' buttons (for hosting where downloads are blocked)")
     p.add_argument("--open", action="store_true", help="open the report in a web browser when done")
     p.add_argument("-q", "--quiet", action="store_true", help="only print errors")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -46,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(build_model(project, args.title), sys.stdout, indent=2, ensure_ascii=False)
         sys.stdout.write("\n")
         return 0
-    index = render_site(project, args.output, title=args.title)
+    index = render_site(project, args.output, title=args.title, export=not args.no_export)
     if not args.quiet:
         n_pat = sum(1 for m in project.patterns if CATALOG[m.key][1] != "idiom")
         print(f"Analysed {len(project.modules)} modules, {len(project.classes)} classes, "

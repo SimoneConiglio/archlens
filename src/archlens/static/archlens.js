@@ -7,7 +7,11 @@
   const M = window.ARCHLENS_MODEL;
   if (!M) { document.getElementById('app').textContent = 'Missing assets/model.js'; return; }
   const PAGE = document.body.dataset.page;
-  const PAGE_MODULE = document.body.dataset.module || '';
+  // Hash parameters carry the view's target and state, e.g. module.html#m=pkg.mod&class=pkg.mod.Cls
+  const hashParams = () => new Map(location.hash.slice(1).split('&').filter((kv) => kv.includes('='))
+    .map((kv) => { const i = kv.indexOf('='); return [kv.slice(0, i), decodeURIComponent(kv.slice(i + 1))]; }));
+  const PAGE_MODULE = document.body.dataset.module || hashParams().get('m') || '';
+  const withParam = (href, key, value) => `${href}${href.includes('#') ? '&' : '#'}${key}=${encodeURIComponent(value)}`;
   const CAT = M.catalog;
   const CLASSES = M.classes;
   const CATEGORY_LABEL = { creational: 'Creational', structural: 'Structural', behavioral: 'Behavioral', idiom: 'Python idioms' };
@@ -60,9 +64,9 @@
   }
 
   const pageHref = (kind, mod) => kind === 'overview' ? 'index.html' : kind === 'diagram' ? 'diagram.html'
-    : kind === 'patterns' ? 'patterns.html' : kind === 'package' ? `package-${mod}.html` : `module-${mod}.html`;
+    : kind === 'patterns' ? 'patterns.html' : `${kind}.html#m=${encodeURIComponent(mod)}`;
   const PACKAGES = M.packages || [];
-  const classHref = (id) => `${pageHref('module', CLASSES[id].module)}#class=${encodeURIComponent(id)}`;
+  const classHref = (id) => withParam(pageHref('module', CLASSES[id].module), 'class', id);
   const color = (key) => (CAT[key] || {}).color || '#888';
   const truncate = (t, n) => t.length > n ? t.slice(0, n - 1) + '…' : t;
   const multLabel = (m) => m === '*' ? '0..*' : m === '1' ? '' : (m || '');
@@ -487,7 +491,7 @@
         iconBtn('minus', 'Zoom out', () => this.zoomBy(0.8)),
         iconBtn('fit', 'Fit to screen', () => this.fit()),
         iconBtn('relayout', 'Re-run layout', () => { this.positions.clear(); this.refresh(true); }),
-        this.config.compact ? null : iconBtn('download', 'Download SVG', () => this.exportSvg()));
+        this.config.compact || document.body.dataset.export === 'off' ? null : iconBtn('download', 'Download SVG', () => this.exportSvg()));
       this.host.append(tb);
       if (!this.config.compact) { this.statusEl = h('div', { class: 'status' }); this.host.append(this.statusEl); }
       this.bindPanZoom();
@@ -923,11 +927,23 @@
     return svg;
   }
 
+  function pickerPage(app, kind) {
+    const items = kind === 'package' ? PACKAGES.map((p) => [p.name, p.classes]) : M.modules.filter((m) => m.classes.length).map((m) => [m.name, m.classes.length]);
+    const page = h('main', { class: 'page' }, h('h1', {}, kind === 'package' ? 'Packages' : 'Modules'),
+      h('p', { class: 'subtitle' }, PAGE_MODULE ? `“${PAGE_MODULE}” is not in this report. Pick one below.` : `Pick a ${kind} to open its class diagram.`),
+      h('div', { class: 'panel table-wrap' }, h('table', {}, h('tr', {}, h('th', {}, 'Name'), h('th', { class: 'num' }, 'Classes')),
+        items.map(([n, c]) => h('tr', {}, h('td', {}, h('a', { class: 'mono', href: pageHref(kind, n) }, n)), h('td', { class: 'num' }, c))))));
+    app.append(page);
+    window.addEventListener('hashchange', () => location.reload());
+  }
+
   function diagramPage(app) {
     const isPackage = PAGE === 'package';
     const isModule = PAGE === 'module' || isPackage;  // both show a subset plus neighbouring context
     const mod = PAGE === 'module' ? M.modules.find((m) => m.name === PAGE_MODULE)
-      : isPackage ? { ...PACKAGES.find((p) => p.name === PAGE_MODULE), docstring: (M.modules.find((m) => m.name === PAGE_MODULE) || {}).docstring } : null;
+      : isPackage && PACKAGES.some((p) => p.name === PAGE_MODULE) ? { ...PACKAGES.find((p) => p.name === PAGE_MODULE), docstring: (M.modules.find((m) => m.name === PAGE_MODULE) || {}).docstring } : null;
+    if (isModule && !mod) { pickerPage(app, PAGE); return; }
+    if (isModule) document.title = `${PAGE_MODULE} · ${M.meta.title}`;
     const inPackage = (name) => name === PAGE_MODULE || name.startsWith(PAGE_MODULE + '.');
     const pkgIds = isPackage ? Object.keys(CLASSES).filter((id) => inPackage(CLASSES[id].module)) : null;
     const big = (pkgIds || (PAGE === 'module' ? [] : Object.keys(CLASSES))).length > 80;
@@ -962,8 +978,9 @@
     };
     const onSelect = (id) => {
       renderDetails(details, id, pick, id ? () => diagram.select(null) : null);
-      if (id) history.replaceState(null, '', '#class=' + encodeURIComponent(id));
-      else if (location.hash.startsWith('#class=')) history.replaceState(null, '', location.pathname + location.search);
+      const base = isModule ? `#m=${encodeURIComponent(PAGE_MODULE)}` : '';
+      if (id) history.replaceState(null, '', withParam(base || location.pathname, 'class', id).replace(location.pathname, ''));
+      else if (hashParams().has('class')) history.replaceState(null, '', base || location.pathname + location.search);
     };
 
     // sidebar content
@@ -1030,10 +1047,10 @@
     renderDetails(details, null);
 
     const fromHash = () => {
-      const m = /#class=([^&]+)/.exec(location.hash);
-      const p = /#pattern=([^&]+)/.exec(location.hash);
-      if (m) { const id = decodeURIComponent(m[1]); setTimeout(() => diagram.select(id, true), 50); }
-      if (p) { diagram.highlightPatterns = new Set(decodeURIComponent(p[1]).split(',')); diagram.applyHighlight(); renderPatternLegend(); }
+      const hp = hashParams();
+      if (isModule && (hp.get('m') || '') !== PAGE_MODULE && !document.body.dataset.module) { location.reload(); return; }
+      if (hp.has('class')) { const id = hp.get('class'); setTimeout(() => diagram.select(id, true), 50); }
+      if (hp.has('pattern')) { diagram.highlightPatterns = new Set(hp.get('pattern').split(',')); diagram.applyHighlight(); renderPatternLegend(); }
     };
     fromHash();
     window.addEventListener('hashchange', fromHash);
@@ -1096,7 +1113,7 @@
     const patternChips = (ids, href) => {
       const keys = new Set();
       ids.forEach((id) => CLASSES[id].patterns.forEach((p) => { if (!_isSupport(p) && CAT[p.key].category !== 'idiom') keys.add(p.key); }));
-      return h('div', { class: 'chips' }, [...keys].map((k) => chip(k, null, `${href}#pattern=${k}`)));
+      return h('div', { class: 'chips' }, [...keys].map((k) => chip(k, null, withParam(href, 'pattern', k))));
     };
     if (PACKAGES.length) {
       page.append(h('h2', {}, `Packages (${PACKAGES.length})`), h('div', { class: 'panel table-wrap' }, h('table', {},
@@ -1120,7 +1137,7 @@
         return h('tr', {},
           h('td', {}, h('a', { href: pageHref('module', m.name), class: 'mono' }, m.name), m.docstring ? h('div', { class: 'hint' }, m.docstring.split('\n')[0]) : null),
           h('td', { class: 'num' }, m.classes.length), h('td', { class: 'num' }, m.functions.length),
-          h('td', {}, h('div', { class: 'chips' }, [...keys].map((k) => chip(k, null, `${pageHref('module', m.name)}#pattern=${k}`)))));
+          h('td', {}, h('div', { class: 'chips' }, [...keys].map((k) => chip(k, null, withParam(pageHref('module', m.name), 'pattern', k))))));
       }))));
 
     if (M.warnings.length) {

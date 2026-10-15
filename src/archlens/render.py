@@ -123,7 +123,7 @@ PAGE = """<!doctype html>
 <link rel="stylesheet" href="assets/archlens.css">
 <script>try{{var t=localStorage.getItem('archlens-theme');if(t)document.documentElement.dataset.theme=t;}}catch(e){{}}</script>
 </head>
-<body data-page="{page}" data-module="{module}">
+<body data-page="{page}" data-module="{module}" data-export="{export}">
 <noscript><p style="padding:2rem">ArchLens reports need JavaScript enabled to draw the diagrams.</p></noscript>
 <div id="app"></div>
 <script src="assets/model.js"></script>
@@ -133,12 +133,11 @@ PAGE = """<!doctype html>
 """
 
 
-def module_page_name(module: str) -> str:
-    return f"module-{module}.html"
+def render_site(project: Project, out_dir: str | Path, title: str | None = None, export: bool = True) -> Path:
+    """Write the full report into ``out_dir`` and return the path of ``index.html``.
 
-
-def render_site(project: Project, out_dir: str | Path, title: str | None = None) -> Path:
-    """Write the full report into ``out_dir`` and return the path of ``index.html``."""
+    ``export=False`` hides the "Download SVG" buttons, for hosts whose sandbox blocks downloads.
+    """
     out = Path(out_dir)
     assets = out / "assets"
     assets.mkdir(parents=True, exist_ok=True)
@@ -157,16 +156,15 @@ def render_site(project: Project, out_dir: str | Path, title: str | None = None)
     def page(file: str, kind: str, label: str, module: str = "") -> None:
         (out / file).write_text(
             PAGE.format(title=f"{label} · {name}" if label else name, version=__version__,
-                        page=kind, module=html.escape(module, quote=True)),
+                        page=kind, module=html.escape(module, quote=True), export="on" if export else "off"),
             encoding="utf-8",
         )
 
     page("index.html", "overview", "")
     page("diagram.html", "diagram", "Class diagram")
     page("patterns.html", "patterns", "Design patterns")
-    for mod in model["modules"]:
-        page(module_page_name(mod["name"]), "module", mod["name"], mod["name"])
-    for pkg in model["packages"]:
-        page(f"package-{pkg['name']}.html", "package", pkg["name"], pkg["name"])
+    # One page per view kind: the module or package to show is read from the URL hash (#m=name).
+    page("module.html", "module", "Module")
+    page("package.html", "package", "Package")
     (out / "model.json").write_text(json.dumps(model, indent=2, ensure_ascii=False), encoding="utf-8")
     return out / "index.html"

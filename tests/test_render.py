@@ -24,10 +24,10 @@ def test_render_site_layout(zoo, tmp_path):
     for name in ("index.html", "diagram.html", "patterns.html", "model.json",
                  "assets/archlens.js", "assets/archlens.css", "assets/model.js"):
         assert (out / name).is_file(), name
-    for mod in zoo.modules:
-        assert (out / f"module-{mod}.html").is_file()
-    page = (out / "module-patterns_zoo.shapes.html").read_text()
-    assert 'data-page="module"' in page and 'data-module="patterns_zoo.shapes"' in page
+    assert not list(out.glob("module-*.html")), "module views share one page routed by #m=<name>"
+    page = (out / "module.html").read_text()
+    assert 'data-page="module"' in page and 'data-export="on"' in page
+    assert 'data-page="package"' in (out / "package.html").read_text()
 
 
 def test_model_payload(zoo, tmp_path):
@@ -49,6 +49,9 @@ def test_cli(tmp_path, capsys):
     assert "Report written" in capsys.readouterr().out
     model = load_model(tmp_path / "r")
     assert "patterns_zoo.behavioral" not in [m["name"] for m in model["modules"]]
+
+    assert main([str(ZOO), "-o", str(tmp_path / "r2"), "-q", "--no-export"]) == 0
+    assert 'data-export="off"' in (tmp_path / "r2" / "diagram.html").read_text()
 
     assert main([str(ZOO), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["classes"]
@@ -79,4 +82,4 @@ def test_package_pages(tmp_path):
     # only sub-packages grouping classes from several modules get a page; the root is the full diagram
     assert [p["name"] for p in model["packages"]] == ["pkg.sub"]
     assert model["packages"][0] == {"name": "pkg.sub", "docstring": "A sub-package.", "modules": 3, "classes": 2}
-    assert 'data-page="package"' in (tmp_path / "out" / "package-pkg.sub.html").read_text()
+

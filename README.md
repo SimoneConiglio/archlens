@@ -21,8 +21,8 @@ safe to run on any code base. There are **no runtime dependencies**, and the rep
 |---|---|
 | `index.html` | Overview: counts, pattern distribution, most-connected classes (fan-in/out, inheritance depth), module table |
 | `diagram.html` | Whole-package class diagram, with module filter |
-| `package-<name>.html` | One diagram per sub-package (e.g. `mypkg.solvers`) — the most useful level for large code bases |
-| `module-<name>.html` | One diagram per module, plus neighbouring classes from other modules as dashed "context" boxes |
+| `package.html#m=<name>` | One diagram per sub-package (e.g. `mypkg.solvers`) — the most useful level for large code bases |
+| `module.html#m=<name>` | One diagram per module, plus neighbouring classes from other modules as dashed "context" boxes |
 | `patterns.html` | Every detected pattern instance: participants and their roles, evidence, confidence, and an on-demand mini diagram |
 | `model.json` | The extracted model, for your own tooling |
 
@@ -48,7 +48,9 @@ safe to run on any code base. There are **no runtime dependencies**, and the rep
 * Toggle attributes, methods, private members, dunder methods, labels and each relation kind; the
   layered layout re-flows automatically. Search with `/`, reset with `Esc`, fit with `f`.
 * **Download SVG** of the current view. Light and dark themes.
-* Deep links: `module-x.html#class=pkg.x.MyClass`, `diagram.html#pattern=observer,strategy`.
+* Deep links: `module.html#m=pkg.x&class=pkg.x.MyClass`, `diagram.html#pattern=observer,strategy`.
+* The whole report is a handful of files (one page per view kind plus `assets/`), whatever the size of the
+  code base; `--no-export` hides the SVG download button for hosts that block downloads.
 
 ### Colour-coded design patterns
 
@@ -93,7 +95,7 @@ and recovers the library's architecture from source alone, for example:
 ## Command line
 
 ```
-archlens SOURCE [-o OUT] [-t TITLE] [-x GLOB ...] [--min-confidence X] [--json] [--open] [-q]
+archlens SOURCE [-o OUT] [-t TITLE] [-x GLOB ...] [--min-confidence X] [--json] [--no-export] [--open] [-q]
 ```
 
 * `SOURCE` — a package directory (with `__init__.py`), a source tree (e.g. `src/`) or a single `.py` file.
