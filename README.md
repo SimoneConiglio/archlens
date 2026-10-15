@@ -21,6 +21,7 @@ safe to run on any code base. There are **no runtime dependencies**, and the rep
 |---|---|
 | `index.html` | Overview: counts, pattern distribution, most-connected classes (fan-in/out, inheritance depth), module table |
 | `diagram.html` | Whole-package class diagram, with module filter |
+| `package-<name>.html` | One diagram per sub-package (e.g. `mypkg.solvers`) — the most useful level for large code bases |
 | `module-<name>.html` | One diagram per module, plus neighbouring classes from other modules as dashed "context" boxes |
 | `patterns.html` | Every detected pattern instance: participants and their roles, evidence, confidence, and an on-demand mini diagram |
 | `model.json` | The extracted model, for your own tooling |
@@ -60,10 +61,10 @@ participants.
 
 | Category | Patterns detected |
 |---|---|
-| Creational | Singleton, Factory / Factory Method, Abstract Factory, Builder, Prototype |
+| Creational | Singleton / Multiton (incl. caching metaclasses), Factory / Factory Method (incl. registry-based plugin factories), Abstract Factory, Builder, Prototype |
 | Structural | Adapter, Decorator, Composite, Proxy, Facade |
 | Behavioural | Observer, Strategy, State, Template Method, Command, Visitor, Iterator, Chain of Responsibility |
-| Python idioms | Registry, Context Manager, Data Class / Value Object, Interface (ABC / Protocol) |
+| Python idioms | Registry (incl. plugin discovery via subclasses / entry points), Context Manager, Data Class / Value Object (dataclasses, attrs, NamedTuple, pydantic models), Interface (ABC / Protocol) |
 
 Detection is heuristic and structural: it looks at who inherits from whom, which attributes hold which
 types (and whether they are created internally or injected), and what methods do — return `self`,
@@ -72,6 +73,22 @@ class-level instance, and so on. Every match carries human-readable **evidence**
 score; use `--min-confidence` to keep only strong matches.
 [`examples/patterns_zoo`](examples/patterns_zoo) contains a reference implementation of every pattern
 and doubles as the test fixture.
+
+### Real-world check: GEMSEO
+
+On [GEMSEO](https://gitlab.com/gemseo/dev/gemseo) 6.3.3 (966 modules, 951 classes) the analysis takes ~3.5 s
+and recovers the library's architecture from source alone, for example:
+
+* **Factory + Registry**: `BaseFactory.create()` instantiates classes discovered through `entry_points()`,
+  specialised by 41 concrete factories, each paired with its product (`MDAFactory → BaseMDA`,
+  `PostFactory → BasePost`, …) read from the generic base `BaseFactory[Product]`.
+* **Multiton**: the `BaseABCMultiton` metaclass caching instances of 62 classes (all factories, DOE libraries).
+* **Template Method**: `execute() → _run()`, `learn() → _learn()`, `BaseMDA._execute() → _solve()`,
+  `BasePost.execute() → _plot()`.
+* **Strategy**: `BaseScenario → BaseFormulation` (MDF, IDF, BiLevel, …), `BaseDiscipline → BaseCache`,
+  `SurrogateDiscipline → BaseRegressor`.
+* **Composite**: `MDASequential`, `ProcessDiscipline`, the ML transformer `Pipeline`.
+* **Observer**: `ExecutionStatus` / `Monitoring` observers and the MDA iteration callbacks.
 
 ## Command line
 

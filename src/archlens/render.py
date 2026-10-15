@@ -58,6 +58,23 @@ def _metrics(project: Project) -> dict[str, dict[str, int]]:
     return out
 
 
+def _packages(modules: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sub-packages that group classes from more than one module (the root package is the full diagram)."""
+    names = {m["name"] for m in modules if m["is_package"]}
+    by_name = {m["name"]: m for m in modules}
+    root = min(names, key=len) if names else None
+    out = []
+    for pkg in sorted(names):
+        if pkg == root and "." not in pkg:
+            continue
+        members = [m for m in modules if m["name"] == pkg or m["name"].startswith(pkg + ".")]
+        n_classes = sum(len(m["classes"]) for m in members)
+        if n_classes and len([m for m in members if m["classes"]]) > 1:
+            out.append({"name": pkg, "docstring": by_name[pkg]["docstring"],
+                        "modules": len(members), "classes": n_classes})
+    return out
+
+
 def build_model(project: Project, title: str | None = None) -> dict[str, Any]:
     data = project.to_dict()
     metrics = _metrics(project)
@@ -82,6 +99,7 @@ def build_model(project: Project, title: str | None = None) -> dict[str, Any]:
         })
     data["patterns"] = patterns
     data["modules"] = sorted(data["modules"].values(), key=lambda m: m["name"])
+    data["packages"] = _packages(data["modules"])
     data["catalog"] = {
         key: {"name": n, "category": c, "color": col, "description": d}
         for key, (n, c, col, d) in CATALOG.items()
@@ -148,5 +166,7 @@ def render_site(project: Project, out_dir: str | Path, title: str | None = None)
     page("patterns.html", "patterns", "Design patterns")
     for mod in model["modules"]:
         page(module_page_name(mod["name"]), "module", mod["name"], mod["name"])
+    for pkg in model["packages"]:
+        page(f"package-{pkg['name']}.html", "package", pkg["name"], pkg["name"])
     (out / "model.json").write_text(json.dumps(model, indent=2, ensure_ascii=False), encoding="utf-8")
     return out / "index.html"

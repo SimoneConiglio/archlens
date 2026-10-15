@@ -116,3 +116,103 @@ def test_min_confidence_filter(zoo):
     project = analyze(zoo.root)
     detect_patterns(project, min_confidence=0.95)
     assert project.patterns and all(m.confidence >= 0.95 for m in project.patterns)
+
+
+PLUGIN_PKG = {
+    "meta.py": textwrap.dedent("""
+        from abc import ABCMeta
+
+        class Multiton(type):
+            _cache: dict = {}
+
+            def __call__(self, *args):
+                instance = self._cache.get(self)
+                if instance is None:
+                    instance = self._cache[self] = super().__call__(*args)
+                return instance
+
+        class ABCMultiton(ABCMeta, Multiton):
+            pass
+    """),
+    "factory.py": textwrap.dedent("""
+        from importlib.metadata import entry_points
+        from typing import Generic, TypeVar
+        from .meta import ABCMultiton
+
+        T = TypeVar("T")
+
+        class BaseFactory(Generic[T], metaclass=ABCMultiton):
+            def __init__(self) -> None:
+                self.__classes: dict[str, type] = {}
+
+            def update(self) -> None:
+                for ep in entry_points(group="plugins"):
+                    self.__classes[ep.name] = ep.load()
+
+            def get_class(self, name: str) -> type[T]:
+                return self.__classes[name]
+
+            def create(self, name: str, **options) -> T:
+                cls = self.get_class(name)
+                return cls(**options)
+    """),
+    "solvers.py": textwrap.dedent("""
+        from abc import abstractmethod
+        from docstring_inheritance import ABCGoogleDocstringInheritanceMeta
+        from pydantic import BaseModel
+        from .factory import BaseFactory
+
+        class BaseSettings(BaseModel):
+            tolerance: float = 1e-6
+
+        class NewtonSettings(BaseSettings):
+            max_iter: int = 10
+
+        class BaseSolver(metaclass=ABCGoogleDocstringInheritanceMeta):
+            def get_residual(self) -> float:
+                return 0.0
+
+        class SolverFactory(BaseFactory[BaseSolver]):
+            pass
+
+        class Cache:
+            @abstractmethod
+            def get_all_entries(self): ...
+
+        class MemoryCache(Cache):
+            def get_all_entries(self):
+                return []
+    """),
+}
+
+
+def test_registry_based_factory_family(tmp_path):
+    p = analyze(write_pkg(tmp_path, PLUGIN_PKG))
+    r = roles(p)
+    assert ("factory", "BaseFactory", "Factory") in r
+    assert ("factory", "SolverFactory", "Concrete Factory") in r
+    assert ("factory", "BaseSolver", "Product") in r  # from the generic base BaseFactory[BaseSolver]
+    assert ("registry", "BaseFactory", "Registry") in r
+    reg = next(m for m in p.patterns if m.key == "registry")
+    assert any("entry_points" in e for e in reg.evidence)
+
+
+def test_multiton_metaclass_applies_to_users_and_subclasses(tmp_path):
+    p = analyze(write_pkg(tmp_path, PLUGIN_PKG))
+    r = roles(p)
+    assert ("singleton", "Multiton", "Multiton metaclass") in r
+    assert ("singleton", "BaseFactory", "Multiton") in r
+    assert ("singleton", "SolverFactory", "Multiton (inherited)") in r
+    assert "metaclass" in p.classes["pkg.meta.ABCMultiton"].stereotypes
+
+
+def test_stereotypes_from_metaclass_and_inheritance(tmp_path):
+    p = analyze(write_pkg(tmp_path, PLUGIN_PKG))
+    assert "abstract" in p.classes["pkg.solvers.BaseSolver"].stereotypes  # ABC-derived metaclass
+    assert "model" in p.classes["pkg.solvers.NewtonSettings"].stereotypes  # inherited pydantic model
+    assert ("data_class", "NewtonSettings", "Data Class") in roles(p)
+
+
+def test_abstract_getter_is_not_a_factory_method(tmp_path):
+    p = analyze(write_pkg(tmp_path, PLUGIN_PKG))
+    assert not [m for m in p.patterns if "pkg.solvers.Cache" in m.participants and m.key == "factory"]

@@ -62,6 +62,7 @@ class Method:
     class_attr_refs: list[str] = field(default_factory=list)
     attr_writes: list[str] = field(default_factory=list)
     raises_not_implemented: bool = False
+    dynamic_instantiation: bool = False  # calls a class looked up at run time, e.g. ``cls = lookup(name); cls()``
     ref_names: list[TypeRef] = field(default_factory=list)  # signature type refs
 
     @property
@@ -91,6 +92,8 @@ class ClassInfo:
     docstring: str | None = None
     bases: list[str] = field(default_factory=list)
     base_ids: list[str | None] = field(default_factory=list)
+    base_args: list[TypeRef] = field(default_factory=list)  # type arguments of generic bases, e.g. Factory[Product]
+    metaclass_id: str | None = None
     metaclass: str | None = None
     decorators: list[str] = field(default_factory=list)
     attributes: list[Attribute] = field(default_factory=list)

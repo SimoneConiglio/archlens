@@ -293,10 +293,13 @@ class ModuleAnalyzer:
         if any(b.endswith(("Exception", "Error", "Warning")) for b in short_bases):
             _add(st, "exception")
         meta = (cls.metaclass or "").rsplit(".", 1)[-1]
-        if "ABC" in short_bases or meta == "ABCMeta":
+        if "ABC" in short_bases or "ABC" in meta:  # ABCMeta and ABC-derived metaclasses
             _add(st, "abstract")
-        if "type" in short_bases or any(b.endswith("Meta") for b in short_bases if b != "ABCMeta"):
+        if "type" in short_bases or any(b.endswith("Meta") for b in short_bases):
             _add(st, "metaclass")
+        for b in node.bases:
+            if isinstance(b, ast.Subscript):
+                cls.base_args += type_refs(b.slice)
         if "Generic" in short_bases or any(isinstance(b, ast.Subscript) for b in node.bases):
             _add(st, "generic")
 
@@ -355,6 +358,10 @@ class ModuleAnalyzer:
                         if t.id in ("__slots__", "__match_args__", "__all__"):
                             continue
                         type_str, refs, origin = self._infer_value(stmt.value, {})
+                        if isinstance(stmt.value, (ast.Name, ast.Attribute)) and not is_enum \
+                                and (dotted(stmt.value) or "").rsplit(".", 1)[-1][:1].isupper():
+                            ref = dotted(stmt.value)
+                            type_str, refs, origin = f"type[{ref}]", [TypeRef(ref)], "classref"
                         put(Attribute(name=t.id, type=type_str, default=unparse(stmt.value, 60),
                                       scope="class", kind="enum_member" if is_enum else "field",
                                       visibility=visibility(t.id), origin=origin, lineno=stmt.lineno, refs=refs))
@@ -423,7 +430,13 @@ class ModuleAnalyzer:
         first = fn.args.posonlyargs[0].arg if fn.args.posonlyargs else (fn.args.args[0].arg if fn.args.args else None)
         self_name = None if m.is_static else first
         cls_names = {cls.name, "cls"} | ({self_name} if m.is_classmethod and self_name else set())
+        if "metaclass" in cls.stereotypes and self_name:
+            cls_names.add(self_name)  # in a metaclass, ``self`` is the class being instantiated
         loop_vars: dict[str, str] = {}
+        # local names bound to a value computed at run time, e.g. ``klass = self.get_class(name)``
+        looked_up = {t.id for node in _walk_no_nested(fn) if isinstance(node, ast.Assign)
+                     and isinstance(node.value, (ast.Call, ast.Subscript))
+                     for t in node.targets if isinstance(t, ast.Name) and t.id != first}
 
         def self_attr(node: ast.AST) -> str | None:
             if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == self_name:
@@ -459,6 +472,9 @@ class ModuleAnalyzer:
             elif isinstance(node, ast.Call):
                 func = node.func
                 name = dotted(func)
+                if isinstance(func, (ast.Call, ast.Subscript)) and dotted(getattr(func, "func", None)) != "type" \
+                        or isinstance(func, ast.Name) and func.id in looked_up:
+                    m.dynamic_instantiation = True
                 if name:
                     _add(m.calls, name)
                 if isinstance(func, ast.Attribute):
@@ -676,6 +692,7 @@ class Resolver:
 
 
 STRENGTH = {"composition": 3, "aggregation": 2, "dependency": 1}
+INHERITED_STEREOTYPES = ("exception", "model", "metaclass", "enum", "typeddict")
 
 
 def build_relations(project: Project) -> None:
@@ -708,8 +725,11 @@ def build_relations(project: Project) -> None:
                 rels[(cls.id, target, kind)] = Relation(cls.id, target, kind)
                 if cls.id not in tgt.subclasses:
                     tgt.subclasses.append(cls.id)
+        for ref in cls.base_args:
+            ref.target = resolver.resolve(ref.name, cls.module, cls)
         if cls.metaclass:
             meta = resolver.resolve(cls.metaclass, cls.module, None)
+            cls.metaclass_id = meta
             if meta:
                 add_assoc(cls.id, meta, "dependency", "«metaclass»", None)
         # attributes
@@ -720,7 +740,7 @@ def build_relations(project: Project) -> None:
                 ref.target = resolver.resolve(ref.name, cls.module, cls)
                 if not ref.target:
                     continue
-                if attr.kind == "property":
+                if attr.kind == "property" or attr.origin == "classref":
                     add_assoc(cls.id, ref.target, "dependency", attr.name, ref.multiplicity)
                     continue
                 if attr.origin == "created":
@@ -755,16 +775,21 @@ def build_relations(project: Project) -> None:
             continue
         project.relations.append(r)
 
-    # exception stereotype propagates down the hierarchy
+    # Stereotypes that are inherited: subclasses of exceptions, pydantic models, metaclasses, enums and
+    # TypedDicts keep the nature of their base. A metaclass applies to every subclass as well.
     changed = True
     while changed:
         changed = False
         for cls in project.classes.values():
-            if "exception" in cls.stereotypes:
-                continue
-            if any(b and "exception" in project.classes[b].stereotypes for b in cls.base_ids):
-                cls.stereotypes.append("exception")
-                changed = True
+            for b in filter(None, cls.base_ids):
+                base = project.classes[b]
+                for st in INHERITED_STEREOTYPES:
+                    if st in base.stereotypes and st not in cls.stereotypes:
+                        cls.stereotypes.append(st)
+                        changed = True
+                if cls.metaclass_id is None and base.metaclass_id is not None:
+                    cls.metaclass_id = base.metaclass_id
+                    changed = True
 
 
 # --------------------------------------------------------------------------- entry point

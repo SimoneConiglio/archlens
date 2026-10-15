@@ -60,3 +60,23 @@ def test_cli(tmp_path, capsys):
 def test_client_script_parses(tmp_path, zoo):
     render_site(zoo, tmp_path)
     subprocess.run(["node", "--check", str(tmp_path / "assets" / "archlens.js")], check=True)
+
+
+def test_package_pages(tmp_path):
+    from archlens import analyze
+
+    from .conftest import write_pkg
+
+    pkg = write_pkg(tmp_path / "src", {
+        "sub/__init__.py": '"""A sub-package."""\n',
+        "sub/a.py": "class A: ...\n",
+        "sub/b.py": "from .a import A\nclass B(A): ...\n",
+        "lonely/__init__.py": "",
+        "lonely/c.py": "class C: ...\n",
+    })
+    render_site(analyze(pkg), tmp_path / "out")
+    model = load_model(tmp_path / "out")
+    # only sub-packages grouping classes from several modules get a page; the root is the full diagram
+    assert [p["name"] for p in model["packages"]] == ["pkg.sub"]
+    assert model["packages"][0] == {"name": "pkg.sub", "docstring": "A sub-package.", "modules": 3, "classes": 2}
+    assert 'data-page="package"' in (tmp_path / "out" / "package-pkg.sub.html").read_text()

@@ -60,7 +60,8 @@
   }
 
   const pageHref = (kind, mod) => kind === 'overview' ? 'index.html' : kind === 'diagram' ? 'diagram.html'
-    : kind === 'patterns' ? 'patterns.html' : `module-${mod}.html`;
+    : kind === 'patterns' ? 'patterns.html' : kind === 'package' ? `package-${mod}.html` : `module-${mod}.html`;
+  const PACKAGES = M.packages || [];
   const classHref = (id) => `${pageHref('module', CLASSES[id].module)}#class=${encodeURIComponent(id)}`;
   const color = (key) => (CAT[key] || {}).color || '#888';
   const truncate = (t, n) => t.length > n ? t.slice(0, n - 1) + '…' : t;
@@ -96,10 +97,15 @@
     const nav = h('nav', { class: 'nav' },
       [['overview', 'Overview'], ['diagram', 'Class diagram'], ['patterns', 'Patterns']].map(([k, label]) =>
         h('a', { href: pageHref(k), class: PAGE === k ? 'active' : null }, label)));
+    const withClasses = M.modules.filter((m) => m.classes.length);
     const sel = h('select', {
-      'aria-label': 'Open module', onchange: (e) => { if (e.target.value) location.href = pageHref('module', e.target.value); },
-    }, h('option', { value: '' }, `Modules (${M.modules.length})…`),
-    M.modules.map((m) => h('option', { value: m.name, selected: m.name === PAGE_MODULE ? true : null }, `${m.name} (${m.classes.length})`)));
+      'aria-label': 'Open package or module',
+      onchange: (e) => { const [k, n] = e.target.value.split('|'); if (n) location.href = pageHref(k, n); },
+    }, h('option', { value: '' }, PACKAGES.length ? `Packages & modules…` : `Modules (${withClasses.length})…`),
+    PACKAGES.length ? h('optgroup', { label: `Packages (${PACKAGES.length})` }, PACKAGES.map((p) =>
+      h('option', { value: 'package|' + p.name, selected: PAGE === 'package' && p.name === PAGE_MODULE ? true : null }, `${p.name} (${p.classes})`))) : null,
+    h('optgroup', { label: `Modules (${withClasses.length})` }, withClasses.map((m) =>
+      h('option', { value: 'module|' + m.name, selected: PAGE === 'module' && m.name === PAGE_MODULE ? true : null }, `${m.name} (${m.classes.length})`))));
     const theme = iconBtn('theme', 'Toggle dark mode', () => {
       const root = document.documentElement;
       const dark = root.dataset.theme ? root.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
@@ -918,25 +924,30 @@
   }
 
   function diagramPage(app) {
-    const isModule = PAGE === 'module';
-    const mod = isModule ? M.modules.find((m) => m.name === PAGE_MODULE) : null;
-    const big = Object.keys(CLASSES).length > 80;
-    const key = 'archlens-opts-' + (isModule ? 'module' : 'diagram');
+    const isPackage = PAGE === 'package';
+    const isModule = PAGE === 'module' || isPackage;  // both show a subset plus neighbouring context
+    const mod = PAGE === 'module' ? M.modules.find((m) => m.name === PAGE_MODULE)
+      : isPackage ? { ...PACKAGES.find((p) => p.name === PAGE_MODULE), docstring: (M.modules.find((m) => m.name === PAGE_MODULE) || {}).docstring } : null;
+    const inPackage = (name) => name === PAGE_MODULE || name.startsWith(PAGE_MODULE + '.');
+    const pkgIds = isPackage ? Object.keys(CLASSES).filter((id) => inPackage(CLASSES[id].module)) : null;
+    const big = (pkgIds || (PAGE === 'module' ? [] : Object.keys(CLASSES))).length > 80;
+    const key = 'archlens-opts-' + PAGE;
     const saved = store.get(key, {});
     const opt = {
       attributes: saved.attributes ?? true,
-      methods: saved.methods ?? (!big || isModule),
+      methods: saved.methods ?? !big,
       specialMethods: saved.specialMethods ?? false,
       privateMembers: saved.privateMembers ?? true,
       labels: saved.labels ?? true,
       context: isModule ? (saved.context ?? true) : false,
       contextDependencies: false,
       dependencyLayers: saved.dependencyLayers ?? false,
-      relations: new Set(saved.relations || (big && !isModule ? ['inheritance', 'realization', 'composition', 'aggregation'] : RELS)),
+      relations: new Set(saved.relations || (big ? ['inheritance', 'realization', 'composition', 'aggregation'] : RELS)),
     };
     const save = () => store.set(key, { ...opt, relations: [...opt.relations] });
-    const hiddenModules = new Set(isModule ? [] : store.get('archlens-hidden-modules', []));
-    const ids = () => isModule ? mod.classes : Object.keys(CLASSES).filter((id) => !hiddenModules.has(CLASSES[id].module));
+    const hiddenModules = new Set(PAGE === 'module' ? [] : store.get('archlens-hidden-modules-' + (PAGE_MODULE || '*'), []));
+    const ids = () => PAGE === 'module' ? mod.classes
+      : (pkgIds || Object.keys(CLASSES)).filter((id) => !hiddenModules.has(CLASSES[id].module));
 
     const sidebar = h('aside', { class: 'sidebar' });
     const canvas = h('div', { class: 'canvas' });
@@ -968,14 +979,14 @@
     const relayout = () => diagram.refresh(true);
 
     sidebar.append(...[
-      isModule ? h('div', {}, h('h3', {}, 'Module'), h('div', { class: 'mono', style: { wordBreak: 'break-all' } }, mod.name),
+      isModule ? h('div', {}, h('h3', {}, isPackage ? `Package · ${mod.classes} classes` : 'Module'), h('div', { class: 'mono', style: { wordBreak: 'break-all' } }, mod.name),
         mod.docstring ? h('p', { class: 'hint' }, mod.docstring.split('\n')[0]) : null) : null,
       h('h3', {}, 'Find'), search,
       h('h3', {}, 'Show'),
       check('Attributes', 'attributes', relayout), check('Methods', 'methods', relayout),
       check('Private & protected members', 'privateMembers', relayout), check('Special (dunder) methods', 'specialMethods', relayout),
       check('Relation labels', 'labels', rerender),
-      isModule ? check('Neighbours from other modules', 'context', relayout) : null,
+      isModule ? check(`Neighbours from other ${isPackage ? 'packages' : 'modules'}`, 'context', relayout) : null,
       check('Dependencies shape layout', 'dependencyLayers', relayout),
       h('h3', {}, 'Relations'),
       h('div', { class: 'rel-legend' }, RELS.flatMap((k) => [relLegendSample(k), h('label', { class: 'opt', title: REL_HELP[k] },
@@ -984,11 +995,12 @@
     ].filter(Boolean));
     const patSection = h('div', {});
     sidebar.append(h('h3', {}, 'Design patterns'), h('p', { class: 'hint', style: { margin: '0 0 6px' } }, 'Click to highlight participants.'), patSection);
-    if (!isModule && M.modules.length > 1) {
-      const list = h('div', { class: 'module-list' }, M.modules.filter((m) => m.classes.length).map((m) => h('label', { class: 'opt' },
+    if (PAGE !== 'module' && M.modules.length > 1) {
+      const mods = M.modules.filter((m) => m.classes.length && (!isPackage || inPackage(m.name)));
+      const list = h('div', { class: 'module-list' }, mods.map((m) => h('label', { class: 'opt' },
         h('input', { type: 'checkbox', checked: hiddenModules.has(m.name) ? null : true, onchange: (e) => {
           if (e.target.checked) hiddenModules.delete(m.name); else hiddenModules.add(m.name);
-          store.set('archlens-hidden-modules', [...hiddenModules]); relayout(); renderPatternLegend();
+          store.set('archlens-hidden-modules-' + (PAGE_MODULE || '*'), [...hiddenModules]); relayout(); renderPatternLegend();
         } }), h('span', { class: 'mono' }, m.name), h('span', { class: 'hint' }, ` ${m.classes.length}`))));
       sidebar.append(h('h3', {}, 'Modules'), list);
     }
@@ -1081,10 +1093,28 @@
       h('section', { class: 'panel' }, h('h2', { style: { marginTop: 0 } }, 'Detected patterns'), bars),
       h('section', { class: 'panel' }, h('h2', { style: { marginTop: 0 } }, 'Most connected classes'), top.length ? hot : h('p', { class: 'empty' }, 'No classes found.'))));
 
-    // modules
-    page.append(h('h2', {}, 'Modules'), h('div', { class: 'panel table-wrap' }, h('table', {},
+    const patternChips = (ids, href) => {
+      const keys = new Set();
+      ids.forEach((id) => CLASSES[id].patterns.forEach((p) => { if (!_isSupport(p) && CAT[p.key].category !== 'idiom') keys.add(p.key); }));
+      return h('div', { class: 'chips' }, [...keys].map((k) => chip(k, null, `${href}#pattern=${k}`)));
+    };
+    if (PACKAGES.length) {
+      page.append(h('h2', {}, `Packages (${PACKAGES.length})`), h('div', { class: 'panel table-wrap' }, h('table', {},
+        h('tr', {}, h('th', {}, 'Package'), h('th', { class: 'num' }, 'Modules'), h('th', { class: 'num' }, 'Classes'), h('th', {}, 'Patterns')),
+        PACKAGES.map((p) => {
+          const ids = Object.keys(CLASSES).filter((id) => CLASSES[id].module === p.name || CLASSES[id].module.startsWith(p.name + '.'));
+          const depth = p.name.split('.').length - PACKAGES[0].name.split('.').length;
+          return h('tr', {},
+            h('td', {}, h('a', { href: pageHref('package', p.name), class: 'mono', style: { paddingLeft: `${Math.max(0, depth) * 14}px` } }, p.name),
+              p.docstring ? h('div', { class: 'hint', style: { paddingLeft: `${Math.max(0, depth) * 14}px` } }, p.docstring.split('\n')[0]) : null),
+            h('td', { class: 'num' }, p.modules), h('td', { class: 'num' }, p.classes),
+            h('td', {}, patternChips(ids, pageHref('package', p.name))));
+        }))));
+    }
+    const classModules = M.modules.filter((m) => m.classes.length);
+    page.append(h('h2', {}, `Modules with classes (${classModules.length})`), h('div', { class: 'panel table-wrap' }, h('table', {},
       h('tr', {}, h('th', {}, 'Module'), h('th', { class: 'num' }, 'Classes'), h('th', { class: 'num' }, 'Functions'), h('th', {}, 'Patterns')),
-      M.modules.map((m) => {
+      classModules.map((m) => {
         const keys = new Set();
         m.classes.forEach((id) => CLASSES[id].patterns.forEach((p) => { if (!_isSupport(p)) keys.add(p.key); }));
         return h('tr', {},

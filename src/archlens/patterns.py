@@ -47,6 +47,9 @@ OBSERVER_ATTR = re.compile(r"(observer|listener|subscriber|callback|handler|watc
 ADD_METHOD = re.compile(r"^(attach|subscribe|register|add_(listener|observer|handler|callback|subscriber)|on|connect|add_hook|listen|watch)$")
 NOTIFY_METHOD = re.compile(r"^_?(notify|emit|publish|fire|dispatch|trigger|broadcast|signal|send|notify_\w+|_notify\w*)$")
 CREATE_METHOD = re.compile(r"^(create|make|new|build|get|produce|construct|spawn)(_\w+)?$")
+# Abstract methods with these names are factory methods; ``get_*`` is too generic to count.
+ABSTRACT_CREATE = re.compile(r"^(create|make|new|build|produce|construct|spawn)(_\w+)?$")
+DISCOVERY_CALL = re.compile(r"(subclass|entry_points|import_module|iter_modules|walk_packages)", re.I)
 BUILD_METHOD = {"build", "create", "get_result", "result", "construct", "done", "finish", "to_object", "make"}
 COMMAND_METHODS = {"execute", "run", "__call__", "do", "undo", "perform", "apply", "invoke", "redo"}
 CHAIN_ATTR = re.compile(r"(next|successor|_next|parent_handler|next_handler|_successor)", re.I)
@@ -129,22 +132,77 @@ def detect_singleton(ctx: Context) -> list[PatternMatch]:
                 ev.append(f"{m.name}() returns the cached class-level instance")
         if "metaclass" in cls.stereotypes:
             call = cls.method("__call__")
-            if call and any("instance" in a.lower() for a in call.class_attr_refs):
+            tables = {a.name for a in cls.attributes if a.scope == "class"
+                      and ((a.type or "").split("[")[0].lower() in ("dict", "weakvaluedictionary")
+                           or (a.default or "").startswith(("{", "dict(", "WeakValueDictionary(")))}
+            if call and any("instance" in a.lower() or a in tables for a in call.class_attr_refs):
                 ev.append("metaclass __call__ caches instances per class")
         if cls.metaclass and "singleton" in cls.metaclass.lower():
             ev.append(f"uses metaclass {cls.metaclass}")
         if any("singleton" in d.lower() for d in cls.decorators):
             ev.append("decorated as singleton")
         if ev:
-            role = "Singleton metaclass" if "metaclass" in cls.stereotypes else "Singleton"
+            kind = "Multiton" if "multiton" in cls.name.lower() else "Singleton"
+            role = f"{kind} metaclass" if "metaclass" in cls.stereotypes else "Singleton"
             out.append(PatternMatch("singleton", {cid: role}, ev, 0.9 if len(ev) > 1 or "__new__" in ev[0] else 0.75))
+    # Classes created through a caching metaclass are singletons (or multitons) themselves.
+    metas = {cid: m for m in out for cid, role in m.participants.items() if role.endswith("metaclass")}
+    for meta in list(metas):  # metaclasses derived from a caching metaclass cache too
+        for d in ctx.descendants(meta):
+            metas.setdefault(d, metas[meta])
+    for cid, cls in ctx.classes.items():
+        meta = cls.metaclass_id
+        if meta in metas and cid not in metas:
+            m = metas[meta]
+            kind = "Multiton" if "Multiton" in next(iter(m.participants.values())) else "Singleton"
+            m.participants[cid] = kind if cls.metaclass else f"{kind} (inherited)"
+    for m in metas.values():
+        users = [c for c, r in m.participants.items() if not r.endswith("metaclass")]
+        if users and not any(e.startswith("instances of") for e in m.evidence):
+            m.evidence.append(f"instances of {len(users)} classes are cached through it")
     return out
+
+
+def _products(ctx: Context, cid: str) -> set[str]:
+    """Product classes declared by a factory: ``Factory[Product]`` bases or ``_CLASS = Product`` class attributes."""
+    found: set[str] = set()
+    for c in [cid, *ctx.ancestors(cid)]:
+        cls = ctx.classes[c]
+        found.update(r.target for r in cls.base_args if r.target)
+        if not found:
+            for a in cls.attributes:
+                if a.origin == "classref" and a.scope == "class":
+                    found.update(r.target for r in a.refs if r.target)
+        if found:
+            break
+    return found
 
 
 def detect_factories(ctx: Context) -> list[PatternMatch]:
     out = []
+    covered: set[str] = set()
+    # Dynamic factories: create() instantiates a class looked up at run time (registry / plugin based).
     for cid, cls in ctx.classes.items():
-        abstract_creators = [m for m in cls.methods if CREATE_METHOD.match(m.name) and m.is_abstract and m.name != "get"]
+        dyn = [m for m in cls.methods if m.dynamic_instantiation and ABSTRACT_CREATE.match(m.name)]
+        if not dyn:
+            continue
+        parts = {cid: "Factory"}
+        for p in _products(ctx, cid):
+            parts.setdefault(p, "Product")
+        for d in sorted(ctx.descendants(cid)):
+            parts[d] = "Concrete Factory"
+            for p in _products(ctx, d):
+                parts.setdefault(p, "Product")
+        n_conc = sum(1 for r in parts.values() if r == "Concrete Factory")
+        ev = [f"{dyn[0].name}() instantiates a class looked up by name at run time"]
+        if n_conc:
+            ev.append(f"specialised by {n_conc} concrete factories")
+        out.append(PatternMatch("factory", parts, ev, 0.9))
+        covered.update(c for c, r in parts.items() if r != "Product")
+    for cid, cls in ctx.classes.items():
+        if cid in covered:
+            continue
+        abstract_creators = [m for m in cls.methods if ABSTRACT_CREATE.match(m.name) and m.is_abstract]
         if len(abstract_creators) >= 2:
             parts = {cid: "Abstract Factory"}
             for d in ctx.descendants(cid):
@@ -301,7 +359,7 @@ def detect_wrappers(ctx: Context) -> list[PatternMatch]:
                     if same_name or deleg or is_proxy:
                         key = "proxy" if is_proxy else "decorator"
                         role = "Proxy" if is_proxy else "Decorator"
-                        parts = {cid: role, target: "Subject" if is_proxy else "Component"}
+                        parts = {cid: role, target: "Subject interface" if is_proxy else "Component"}
                         if not is_proxy:
                             for sib in ctx.descendants(target):
                                 if sib != cid and sib not in ctx.ancestors(cid):
@@ -315,15 +373,16 @@ def detect_wrappers(ctx: Context) -> list[PatternMatch]:
                         break
                 elif target != cid and (shared_ifaces := sorted(a for a in anc & ctx.ancestors(target)
                                                                  if ctx.is_abstractish(a))) and (
-                        "proxy" in cls.name.lower() or same_name
-                        or any(attr.name in m.attr_writes for m in cls.methods if m.name != "__init__")):
+                        "proxy" in cls.name.lower()
+                        or any(attr.name in m.attr_writes for m in cls.methods if m.name != "__init__")
+                        or len(same_name) >= 2 and len(same_name) * 2 >= len(_public(cls.methods))):
                     # Proxy: same (abstract) interface as the real subject it creates or controls access to
                     shared = shared_ifaces[0]
                     lazy = any(attr.name in m.attr_writes for m in cls.methods if m.name != "__init__")
                     ev = [f"implements {ctx.name(shared)} like the real subject {ctx.name(target)} held in '{attr.name}'"]
                     if lazy:
                         ev.append("creates the real subject lazily on first use")
-                    out.append(PatternMatch("proxy", {cid: "Proxy", target: "Real Subject", shared: "Subject"}, ev,
+                    out.append(PatternMatch("proxy", {cid: "Proxy", target: "Real Subject", shared: "Subject interface"}, ev,
                                             0.85 if lazy or "proxy" in cls.name.lower() else 0.65))
                     done = True
                     break
@@ -332,7 +391,8 @@ def detect_wrappers(ctx: Context) -> list[PatternMatch]:
                     overridden = [m.name for m in _public(cls.methods)
                                   if any(a.method(m.name) for a in map(ctx.classes.get, anc) if a)]
                     translated = [m for m in overridden if m in deleg and m not in deleg[m]]
-                    if translated and (len(translated) * 2 >= len(overridden) or "adapter" in cls.name.lower()):
+                    if "adapter" in cls.name.lower() and translated or (
+                            len(translated) >= 2 and len(translated) * 2 >= len(overridden) and attr.origin == "injected"):
                         tgt = next((a for a in ctx.parents[cid]), None)
                         parts = {cid: "Adapter", target: "Adaptee"}
                         if tgt:
@@ -457,7 +517,8 @@ def detect_strategy_state(ctx: Context) -> list[PatternMatch]:
                       f"delegates via {', '.join(u + '()' for u in used[:3])}"]
                 if is_state and any(attr.name in m.attr_writes for m in cls.methods if m.name != "__init__"):
                     ev.append(f"transitions by reassigning '{attr.name}'")
-                out.append(PatternMatch(key, parts, ev, 0.85 if len(impls) >= 2 else 0.65))
+                conf = (0.85 if len(impls) >= 2 else 0.65) if ctx.is_abstractish(target) else 0.6
+                out.append(PatternMatch(key, parts, ev, conf))
     return out
 
 
@@ -506,7 +567,9 @@ def detect_command(ctx: Context) -> list[PatternMatch]:
             ev = [f"abstract {abstract_cmds[0].name}() implemented by {len(impls)} commands"]
             if cls.method("undo"):
                 ev.append("supports undo()")
-            out.append(PatternMatch("command", parts, ev, 0.85 if cls.name.lower().endswith("command") else 0.7))
+            has_invoker = "Invoker" in parts.values()
+            conf = 0.85 if cls.name.lower().endswith("command") else 0.7 if has_invoker else 0.55
+            out.append(PatternMatch("command", parts, ev, conf))
             bases_done.add(cid)
     # Name-based families: ...Command classes with an execute-like method
     for cid, cls in ctx.classes.items():
@@ -561,6 +624,26 @@ def detect_iterator(ctx: Context) -> list[PatternMatch]:
 def detect_registry(ctx: Context) -> list[PatternMatch]:
     out = []
     for cid, cls in ctx.classes.items():
+        # Plugin discovery: a table filled by scanning subclasses, entry points or packages.
+        discovered = False
+        for a in cls.attributes:
+            if (a.type or a.default or "").split("[")[0].split("(")[0].lower() not in ("dict", "{}", "defaultdict"):
+                continue
+            for m in cls.methods:
+                if a.name in m.attr_writes and m.name != "__init__":
+                    finders = [c for c in m.calls if DISCOVERY_CALL.search(c)]
+                    finder = min(finders, key=lambda c: (not re.search("subclass|entry_points", c, re.I), c),
+                                 default=None)
+                    if finder:
+                        out.append(PatternMatch("registry", {cid: "Registry"},
+                                                [f"table '{a.name}' filled by {m.name}()",
+                                                 f"classes are discovered dynamically via {finder}()"], 0.85))
+                        discovered = True
+                        break
+            if discovered:
+                break
+        if discovered:
+            continue
         reg_attrs = [a for a in cls.attributes if a.scope == "class" and
                      ((a.type or "").split("[")[0].lower() in ("dict", "list", "set", "defaultdict")
                       or (a.default or "").startswith(("{", "[", "dict(", "defaultdict(")))]
@@ -648,8 +731,13 @@ def detect_patterns(project: Project, min_confidence: float = 0.0) -> list[Patte
     return matches
 
 
+SUPPORTING_ROLES = {
+    "Real Subject", "Subject interface", "Handler (abstract)", "Product", "Product (abstract)", "Leaf", "Component",
+    "Adaptee", "Target", "Subsystem", "Element", "Concrete Component", "Implementation", "Registered", "Aggregate",
+    "Observer", "Concrete Observer", "Invoker",
+}
+
+
 def is_supporting(role: str) -> bool:
     """True for roles that merely take part in a pattern (e.g. a Product) rather than embody it."""
-    return role in {"Real Subject", "Handler (abstract)", "Product", "Product (abstract)", "Leaf", "Component", "Subject", "Adaptee", "Target", "Subsystem",
-                    "Element", "Concrete Component", "Implementation", "Registered", "Aggregate", "Observer",
-                    "Concrete Observer", "Invoker"}
+    return role in SUPPORTING_ROLES or role.endswith("(inherited)")
