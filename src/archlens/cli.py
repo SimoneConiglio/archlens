@@ -17,13 +17,16 @@ from .render import build_model, render_site
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="archlens",
-        description="Generate interactive HTML class diagrams and design-pattern reports for a Python package.",
+        description="Generate interactive HTML class diagrams and design-pattern reports for Python, C++ and "
+                    "Tcl/TclOO code.",
     )
     p.add_argument("source", help="package directory, source tree or single .py file to analyse")
     p.add_argument("-o", "--output", default="archlens-report", help="output directory (default: %(default)s)")
     p.add_argument("-t", "--title", help="report title (default: package name)")
     p.add_argument("-x", "--exclude", action="append", default=[], metavar="GLOB",
                    help="exclude files matching a glob relative to the source, e.g. 'tests/*' (repeatable)")
+    p.add_argument("-l", "--language", action="append", choices=["python", "cpp", "tcl"], metavar="LANG",
+                   help="analyse only these languages: python, cpp, tcl (repeatable; default: every language found)")
     p.add_argument("--min-confidence", type=float, default=0.0, metavar="X",
                    help="drop pattern matches below this confidence (0-1)")
     p.add_argument("--json", action="store_true", help="print the analysed model as JSON to stdout instead of writing HTML")
@@ -38,8 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        project = analyze(args.source, exclude=args.exclude)
-    except FileNotFoundError as exc:
+        project = analyze(args.source, exclude=args.exclude, languages=args.language)
+    except (FileNotFoundError, RuntimeError) as exc:
         print(f"archlens: {exc}", file=sys.stderr)
         return 2
     if args.min_confidence:

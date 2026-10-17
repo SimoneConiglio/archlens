@@ -11,7 +11,7 @@ import fnmatch
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
-from .model import Attribute, ClassInfo, Method, ModuleInfo, Param, Project, Relation, TypeRef
+from .model import Attribute, ClassInfo, Method, ModuleInfo, Param, Project, TypeRef
 
 SKIP_DIRS = {
     "__pycache__", ".git", ".hg", ".svn", ".tox", ".nox", ".venv", "venv", "env",
@@ -396,6 +396,7 @@ class ModuleAnalyzer:
         doc = ast.get_docstring(fn)
         m = Method(
             name=fn.name,
+            kind="constructor" if fn.name == "__init__" else "method",
             returns=unparse(fn.returns, 80),
             decorators=decos,
             visibility=visibility(fn.name),
@@ -691,73 +692,25 @@ class Resolver:
         return None
 
 
-STRENGTH = {"composition": 3, "aggregation": 2, "dependency": 1}
-INHERITED_STEREOTYPES = ("exception", "model", "metaclass", "enum", "typeddict")
-
-
-def build_relations(project: Project) -> None:
+def resolve_python(project: Project) -> None:
+    """Resolve every class reference of the Python modules to class ids (relations are derived later)."""
     resolver = Resolver(project)
-    rels: dict[tuple[str, str, str], Relation] = {}
-    assoc: dict[tuple[str, str], Relation] = {}
-
-    def add_assoc(src: str, dst: str, kind: str, label: str | None, mult: str | None) -> None:
-        key = (src, dst)
-        cur = assoc.get(key)
-        if cur is None or STRENGTH[kind] > STRENGTH[cur.kind]:
-            labels = cur.label if cur is not None and cur.kind == kind else None
-            assoc[key] = Relation(src, dst, kind, label if not labels else labels, mult)
-        elif cur.kind == kind and label and kind != "dependency":
-            existing = (cur.label or "").split(", ")
-            if label not in existing:
-                cur.label = ", ".join(filter(None, [cur.label, label]))
-            if mult == "*" or cur.multiplicity is None:
-                cur.multiplicity = mult
-
     for cls in project.classes.values():
-        # inheritance
-        cls.base_ids = []
-        for raw in cls.bases:
-            target = resolver.resolve(raw, cls.module, None)
-            cls.base_ids.append(target)
-            if target and target != cls.id:
-                tgt = project.classes[target]
-                kind = "realization" if "protocol" in tgt.stereotypes else "inheritance"
-                rels[(cls.id, target, kind)] = Relation(cls.id, target, kind)
-                if cls.id not in tgt.subclasses:
-                    tgt.subclasses.append(cls.id)
+        if cls.language != "python":
+            continue
+        cls.base_ids = [resolver.resolve(raw, cls.module, None) for raw in cls.bases]
         for ref in cls.base_args:
             ref.target = resolver.resolve(ref.name, cls.module, cls)
         if cls.metaclass:
-            meta = resolver.resolve(cls.metaclass, cls.module, None)
-            cls.metaclass_id = meta
-            if meta:
-                add_assoc(cls.id, meta, "dependency", "«metaclass»", None)
-        # attributes
+            cls.metaclass_id = resolver.resolve(cls.metaclass, cls.module, None)
         for attr in cls.attributes:
             if attr.kind == "enum_member":
                 continue
             for ref in attr.refs:
                 ref.target = resolver.resolve(ref.name, cls.module, cls)
-                if not ref.target:
-                    continue
-                if attr.kind == "property" or attr.origin == "classref":
-                    add_assoc(cls.id, ref.target, "dependency", attr.name, ref.multiplicity)
-                    continue
-                if attr.origin == "created":
-                    kind = "composition"
-                elif attr.origin == "injected":
-                    kind = "aggregation"
-                elif cls.is_data:
-                    kind = "composition"
-                else:
-                    kind = "aggregation"
-                add_assoc(cls.id, ref.target, kind, attr.name, ref.multiplicity)
-        # dependencies from signatures and instantiations
         for m in cls.methods:
             for ref in m.ref_names:
                 ref.target = resolver.resolve(ref.name, cls.module, cls)
-                if ref.target and ref.target != cls.id:
-                    add_assoc(cls.id, ref.target, "dependency", None, None)
             for call in m.calls:
                 head = call.split(".")[-1]
                 if not head[:1].isupper() and "." not in call:
@@ -765,41 +718,13 @@ def build_relations(project: Project) -> None:
                 target = resolver.resolve(call, cls.module, cls)
                 if target is None and "." in call:
                     target = resolver.resolve(call.rpartition(".")[0], cls.module, cls)
-                if target and target != cls.id:
-                    add_assoc(cls.id, target, "dependency", None, None)
-
-    inherit_pairs = {(s, t) for (s, t, _k) in rels}
-    project.relations = list(rels.values())
-    for (s, t), r in assoc.items():
-        if r.kind == "dependency" and ((s, t) in inherit_pairs or (t, s) in inherit_pairs):
-            continue
-        project.relations.append(r)
-
-    # Stereotypes that are inherited: subclasses of exceptions, pydantic models, metaclasses, enums and
-    # TypedDicts keep the nature of their base. A metaclass applies to every subclass as well.
-    changed = True
-    while changed:
-        changed = False
-        for cls in project.classes.values():
-            for b in filter(None, cls.base_ids):
-                base = project.classes[b]
-                for st in INHERITED_STEREOTYPES:
-                    if st in base.stereotypes and st not in cls.stereotypes:
-                        cls.stereotypes.append(st)
-                        changed = True
-                if cls.metaclass_id is None and base.metaclass_id is not None:
-                    cls.metaclass_id = base.metaclass_id
-                    changed = True
+                if target:
+                    m.call_targets[call] = target
 
 
 # --------------------------------------------------------------------------- entry point
 
-def analyze(path: str | Path, exclude: Iterable[str] = (), name: str | None = None) -> Project:
-    """Analyse a package directory (or single file) and return a :class:`Project`."""
-    root = Path(path).resolve()
-    if not root.exists():
-        raise FileNotFoundError(f"No such file or directory: {root}")
-    project = Project(name=name or root.stem, root=str(root))
+def analyze_python(root: Path, project: Project, exclude: Iterable[str] = ()) -> None:
     rel_base = root if root.is_dir() else root.parent
     analyzers = []
     for file, mod_name, is_pkg in discover(root, exclude):
@@ -818,8 +743,47 @@ def analyze(path: str | Path, exclude: Iterable[str] = (), name: str | None = No
             if cls.id in project.classes:
                 project.warnings.append(f"{cls.file}:{cls.lineno}: duplicate class definition {cls.id}")
             project.classes[cls.id] = cls
-    build_relations(project)
-    from .patterns import detect_patterns
+    resolve_python(project)
 
+
+LANGUAGES = ("python", "cpp", "tcl")
+
+
+def analyze(path: str | Path, exclude: Iterable[str] = (), name: str | None = None,
+            languages: Iterable[str] | None = None) -> Project:
+    """Analyse a source tree (or single file) and return a :class:`Project`.
+
+    ``languages`` restricts the front-ends to run (``python``, ``cpp``, ``tcl``); by default every
+    language with source files under ``path`` is analysed, and the results share one report.
+    """
+    from . import languages as fe
+    from .patterns import detect_patterns
+    from .relations import derive_relations
+
+    root = Path(path).resolve()
+    if not root.exists():
+        raise FileNotFoundError(f"No such file or directory: {root}")
+    wanted = list(languages) if languages else fe.detect_languages(root, exclude)
+    unknown = set(wanted) - set(LANGUAGES)
+    if unknown:
+        raise ValueError(f"Unsupported language(s): {', '.join(sorted(unknown))}; choose from {', '.join(LANGUAGES)}")
+    project = Project(name=name or root.stem, root=str(root))
+    for lang in wanted:
+        if lang == "python":
+            analyze_python(root, project, exclude)
+        elif lang == "cpp":
+            from .languages.cpp import analyze_cpp
+
+            try:
+                analyze_cpp(root, project, exclude)
+            except RuntimeError as exc:  # tree-sitter not installed
+                if languages:
+                    raise
+                project.warnings.append(f"C++ sources skipped: {exc}")
+        elif lang == "tcl":
+            from .languages.tcl import analyze_tcl
+
+            analyze_tcl(root, project, exclude)
+    derive_relations(project)
     detect_patterns(project)
     return project

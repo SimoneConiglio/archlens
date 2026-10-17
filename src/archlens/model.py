@@ -31,7 +31,8 @@ class Attribute:
     scope: str = "instance"  # instance | class
     kind: str = "field"  # field | property | enum_member
     visibility: str = "public"  # public | protected | private
-    origin: str = "unknown"  # created | injected | annotated | literal | unknown
+    origin: str = "unknown"  # created | injected | annotated | literal | classref | unknown
+    ownership: str | None = None  # owned | shared | reference (languages with explicit ownership, e.g. C++)
     readonly: bool = False
     lineno: int | None = None
     refs: list[TypeRef] = field(default_factory=list)
@@ -40,6 +41,7 @@ class Attribute:
 @dataclass
 class Method:
     name: str
+    kind: str = "method"  # method | constructor | destructor | operator
     params: list[Param] = field(default_factory=list)
     returns: str | None = None
     decorators: list[str] = field(default_factory=list)
@@ -64,6 +66,12 @@ class Method:
     raises_not_implemented: bool = False
     dynamic_instantiation: bool = False  # calls a class looked up at run time, e.g. ``cls = lookup(name); cls()``
     ref_names: list[TypeRef] = field(default_factory=list)  # signature type refs
+    call_targets: dict[str, str] = field(default_factory=dict)  # call expression -> instantiated/used class id
+
+    @property
+    def special(self) -> bool:
+        """Constructors, destructors, operators and Python dunder methods."""
+        return self.kind != "method" or (self.name.startswith("__") and self.name.endswith("__"))
 
     @property
     def signature(self) -> str:
@@ -88,6 +96,8 @@ class ClassInfo:
     module: str
     file: str
     lineno: int
+    language: str = "python"
+    namespace: str | None = None
     end_lineno: int | None = None
     docstring: str | None = None
     bases: list[str] = field(default_factory=list)
@@ -117,7 +127,7 @@ class ClassInfo:
 
     @property
     def is_data(self) -> bool:
-        return any(s in self.stereotypes for s in ("dataclass", "namedtuple", "typeddict", "model", "attrs"))
+        return any(s in self.stereotypes for s in ("dataclass", "namedtuple", "typeddict", "model", "attrs", "struct"))
 
 
 @dataclass
@@ -142,6 +152,7 @@ class ModuleInfo:
     name: str
     file: str
     is_package: bool = False
+    language: str = "python"
     docstring: str | None = None
     classes: list[str] = field(default_factory=list)
     functions: list[str] = field(default_factory=list)

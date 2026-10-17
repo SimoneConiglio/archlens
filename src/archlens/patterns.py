@@ -53,6 +53,36 @@ DISCOVERY_CALL = re.compile(r"(subclass|entry_points|import_module|iter_modules|
 BUILD_METHOD = {"build", "create", "get_result", "result", "construct", "done", "finish", "to_object", "make"}
 COMMAND_METHODS = {"execute", "run", "__call__", "do", "undo", "perform", "apply", "invoke", "redo"}
 CHAIN_ATTR = re.compile(r"(next|successor|_next|parent_handler|next_handler|_successor)", re.I)
+_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+SEQ_TYPES = {"list", "set", "frozenset", "tuple", "deque", "weakset", "sequence", "vector", "array", "queue", "stack",
+             "forward_list", "multiset", "unordered_set", "priority_queue", "span", "qlist", "qvector", "qset"}
+MAP_TYPES = {"dict", "defaultdict", "ordereddict", "mapping", "weakvaluedictionary", "map", "unordered_map", "multimap",
+             "unordered_multimap", "qmap", "qhash", "flat_map"}
+ADD_CALLS = {"append", "add", "setdefault", "insert", "extend", "push_back", "emplace_back", "emplace", "push_front",
+             "lappend", "connect"}
+
+
+def norm(name: str) -> str:
+    """Method names in one convention for matching: ``addObserver`` / ``AddObserver`` -> ``add_observer``."""
+    return _CAMEL.sub("_", name).lower()
+
+
+def container(attr: Attribute) -> str | None:
+    """``"seq"`` or ``"map"`` when an attribute holds a collection (Python, C++ or Tcl types), else None."""
+    text = (attr.type or "").replace("std::", "").strip()
+    head = re.split(r"[\[<(\s]", text, maxsplit=1)[0].split("::")[-1].lower() if text else ""
+    if head in MAP_TYPES:
+        return "map"
+    if head in SEQ_TYPES or any(r.multiplicity == "*" for r in attr.refs):
+        return "seq"
+    default = (attr.default or "").strip()
+    if default.startswith(("{", "dict(", "defaultdict(", "OrderedDict(")):
+        return "map"
+    if default.startswith(("[", "list(", "set(", "deque(")):
+        return "seq"
+    return None
+
+
 REGISTRY_ATTR = re.compile(r"(registry|registered|plugins|_classes|_types|_handlers|_factories|catalog|_map|_lookup)", re.I)
 
 
@@ -67,6 +97,9 @@ class Context:
                 self.children[r.target].append(r.source)
                 self.parents[r.source].append(r.target)
         self._anc: dict[str, set[str]] = {}
+        # call expression -> class id, per class (resolved by each language front-end)
+        self.call_targets: dict[str, dict[str, str]] = {
+            cid: {k: v for m in cls.methods for k, v in m.call_targets.items()} for cid, cls in project.classes.items()}
 
     def ancestors(self, cid: str) -> set[str]:
         if cid not in self._anc:
@@ -114,7 +147,12 @@ class Context:
 
 
 def _public(methods: Iterable[Method]) -> list[Method]:
-    return [m for m in methods if m.visibility == "public" and not m.name.startswith("__")]
+    return [m for m in methods if m.visibility == "public" and not m.special]
+
+
+def _named(cls: ClassInfo, name: str) -> Method | None:
+    """Method by normalised name, so ``set_next``, ``setNext`` and ``SetNext`` all match."""
+    return next((m for m in cls.methods if norm(m.name) == name), None)
 
 
 # --------------------------------------------------------------------------- creational
@@ -127,20 +165,24 @@ def detect_singleton(ctx: Context) -> list[PatternMatch]:
         if new and any("instance" in a.lower() for a in new.class_attr_refs):
             ev.append("__new__ caches and returns a shared instance")
         for m in cls.methods:
-            if (m.is_classmethod or m.is_static) and re.match(r"^(get_?instance|instance|shared|default|get|current)$", m.name, re.I) \
+            if (m.is_classmethod or m.is_static) and re.match(r"^(get_?instance|instance|shared(_instance)?|default|get|current)$", norm(m.name)) \
                     and any("instance" in a.lower() for a in m.class_attr_refs):
                 ev.append(f"{m.name}() returns the cached class-level instance")
         if "metaclass" in cls.stereotypes:
             call = cls.method("__call__")
-            tables = {a.name for a in cls.attributes if a.scope == "class"
-                      and ((a.type or "").split("[")[0].lower() in ("dict", "weakvaluedictionary")
-                           or (a.default or "").startswith(("{", "dict(", "WeakValueDictionary(")))}
+            tables = {a.name for a in cls.attributes if a.scope == "class" and container(a) == "map"}
             if call and any("instance" in a.lower() or a in tables for a in call.class_attr_refs):
                 ev.append("metaclass __call__ caches instances per class")
         if cls.metaclass and "singleton" in cls.metaclass.lower():
             ev.append(f"uses metaclass {cls.metaclass}")
         if any("singleton" in d.lower() for d in cls.decorators):
             ev.append("decorated as singleton")
+        if "singleton" in cls.stereotypes:
+            ev.append("declared with a singleton metaclass (oo::singleton)")
+        ctors = [m for m in cls.methods if m.kind == "constructor" and cls.language != "python"
+                 and "= delete" not in m.decorators]
+        if ev and ctors and all(m.visibility != "public" for m in ctors):
+            ev.append("constructors are not public")
         if ev:
             kind = "Multiton" if "multiton" in cls.name.lower() else "Singleton"
             role = f"{kind} metaclass" if "metaclass" in cls.stereotypes else "Singleton"
@@ -183,7 +225,7 @@ def detect_factories(ctx: Context) -> list[PatternMatch]:
     covered: set[str] = set()
     # Dynamic factories: create() instantiates a class looked up at run time (registry / plugin based).
     for cid, cls in ctx.classes.items():
-        dyn = [m for m in cls.methods if m.dynamic_instantiation and ABSTRACT_CREATE.match(m.name)]
+        dyn = [m for m in cls.methods if m.dynamic_instantiation and ABSTRACT_CREATE.match(norm(m.name))]
         if not dyn:
             continue
         parts = {cid: "Factory"}
@@ -202,7 +244,8 @@ def detect_factories(ctx: Context) -> list[PatternMatch]:
     for cid, cls in ctx.classes.items():
         if cid in covered:
             continue
-        abstract_creators = [m for m in cls.methods if ABSTRACT_CREATE.match(m.name) and m.is_abstract]
+        abstract_creators = [m for m in cls.methods if ABSTRACT_CREATE.match(norm(m.name)) and m.is_abstract
+                             and _returns_class(m)]
         if len(abstract_creators) >= 2:
             parts = {cid: "Abstract Factory"}
             for d in ctx.descendants(cid):
@@ -223,7 +266,7 @@ def detect_factories(ctx: Context) -> list[PatternMatch]:
         ev = []
         parts: dict[str, str] = {cid: "Factory"}
         for m in cls.methods:
-            if not (CREATE_METHOD.match(m.name) or m.name.startswith(("create_", "make_", "new_"))):
+            if not CREATE_METHOD.match(norm(m.name)):
                 continue
             created = set()
             for call in m.calls:
@@ -235,7 +278,7 @@ def detect_factories(ctx: Context) -> list[PatternMatch]:
                 ev.append(f"{m.name}() instantiates {len(created)} different classes")
                 for t in created:
                     parts.setdefault(t, "Product")
-                if ret:
+                if ret and any(ret in ctx.ancestors(t) for t in created):
                     parts[ret] = "Product (abstract)"
             elif created and ret and ret not in created and any(ret in ctx.ancestors(t) for t in created):
                 ev.append(f"{m.name}() returns a {ctx.name(ret)} subtype")
@@ -252,23 +295,23 @@ def detect_factories(ctx: Context) -> list[PatternMatch]:
     return out
 
 
-def _resolve_call(ctx: Context, cls: ClassInfo, call: str) -> str | None:
-    from .analyzer import Resolver  # local import to avoid a cycle
+def _returns_class(m: Method) -> bool:
+    """A creation method returns an object: its return type names a class of the project (or is unknown)."""
+    if not m.returns:
+        return True  # untyped languages and unannotated Python
+    return any(r.target and r.name.split("::")[-1].split(".")[-1] in m.returns for r in m.ref_names)
 
-    resolver = getattr(ctx, "_resolver", None)
-    if resolver is None:
-        resolver = ctx._resolver = Resolver(ctx.p)  # type: ignore[attr-defined]
-    head = call.rsplit(".", 1)[-1]
-    if not head[:1].isupper():
-        return None
-    return resolver.resolve(call, cls.module, cls)
+
+def _resolve_call(ctx: Context, cls: ClassInfo, call: str) -> str | None:
+    """Class instantiated or used by a call expression in ``cls`` (resolved by the language front-end)."""
+    return ctx.call_targets.get(cls.id, {}).get(call)
 
 
 def detect_builder(ctx: Context) -> list[PatternMatch]:
     out = []
     for cid, cls in ctx.classes.items():
-        fluent = [m for m in cls.methods if m.returns_self and not m.name.startswith("__")]
-        builds = [m for m in cls.methods if m.name in BUILD_METHOD or m.name.startswith("build")]
+        fluent = [m for m in cls.methods if m.returns_self and not m.special]
+        builds = [m for m in cls.methods if norm(m.name) in BUILD_METHOD or norm(m.name).startswith("build")]
         if len(fluent) >= 2 and builds:
             parts = {cid: "Builder"}
             for b in builds:
@@ -289,18 +332,30 @@ def detect_builder(ctx: Context) -> list[PatternMatch]:
 
 def detect_prototype(ctx: Context) -> list[PatternMatch]:
     out = []
+    covered: set[str] = set()
     for cid, cls in ctx.classes.items():
+        clone = next((m for m in cls.methods if norm(m.name) == "clone" and m.is_abstract), None)
+        impls = [d for d in ctx.descendants(cid) if any(norm(m.name) == "clone" for m in ctx.classes[d].methods)]
+        if clone is not None and impls and not ctx.ancestors(cid) & covered:
+            parts = {cid: "Prototype"}
+            parts.update({d: "Concrete Prototype" for d in impls})
+            out.append(PatternMatch("prototype", parts, [f"abstract {clone.name}() implemented by {len(impls)} classes"], 0.9))
+            covered.add(cid)
+            covered.update(impls)
+    for cid, cls in ctx.classes.items():
+        if cid in covered:
+            continue
         for m in cls.methods:
-            if m.name not in ("clone", "copy", "__copy__", "__deepcopy__", "duplicate"):
+            if norm(m.name) not in ("clone", "copy", "__copy__", "__deepcopy__", "duplicate"):
                 continue
-            uses_copy = any(c in ("copy.deepcopy", "copy.copy", "deepcopy", "copy") for c in m.calls)
+            uses_copy = any(c in ("copy.deepcopy", "copy.copy", "deepcopy", "copy", "oo::copy") for c in m.calls)
             self_type = any(c in (cls.name, "type", "self.__class__", "cls") for c in m.calls)
             if uses_copy or self_type or m.name in ("__copy__", "__deepcopy__"):
                 parts = {cid: "Prototype"}
                 for d in ctx.descendants(cid):
                     parts[d] = "Concrete Prototype"
                 out.append(PatternMatch("prototype", parts, [f"{m.name}() produces a copy of the instance"],
-                                        0.85 if m.name == "clone" else 0.65))
+                                        0.85 if norm(m.name) == "clone" else 0.65))
                 break
     return out
 
@@ -327,7 +382,7 @@ def detect_wrappers(ctx: Context) -> list[PatternMatch]:
                 iterated = any(attr.name in m.iterated_attrs for m in cls.methods)
                 # Composite: holds many of its own component type
                 if mult == "*" and target in lineage:
-                    if iterated or deleg or any(m.name.startswith(("add", "remove", "append")) for m in cls.methods):
+                    if iterated or deleg or any(norm(m.name).startswith(("add", "remove", "append")) for m in cls.methods):
                         component = target
                         parts = {cid: "Composite", component: "Component"} if component != cid else {cid: "Composite"}
                         for leaf in ctx.descendants(component):
@@ -341,7 +396,9 @@ def detect_wrappers(ctx: Context) -> list[PatternMatch]:
                 if mult == "*":
                     continue
                 same_name = [m for m, calls in deleg.items() if m in calls]
-                if target in lineage and (CHAIN_ATTR.search(attr.name) or cls.method("set_next")):
+                # a successor link only makes a chain when requests are forwarded along it
+                if target in lineage and (CHAIN_ATTR.search(attr.name) or _named(cls, "set_next")) and \
+                        (same_name or _named(cls, "set_next")):
                     parts = {cid: "Handler"}
                     if target != cid:
                         parts[target] = "Handler (abstract)"
@@ -355,7 +412,7 @@ def detect_wrappers(ctx: Context) -> list[PatternMatch]:
                     break
                 if target in lineage and target != cid:
                     is_proxy = "proxy" in cls.name.lower() or attr.origin == "created" \
-                        or any(attr.name in m.attr_writes for m in cls.methods if m.name != "__init__")
+                        or any(attr.name in m.attr_writes for m in cls.methods if m.kind != "constructor")
                     if same_name or deleg or is_proxy:
                         key = "proxy" if is_proxy else "decorator"
                         role = "Proxy" if is_proxy else "Decorator"
@@ -374,11 +431,11 @@ def detect_wrappers(ctx: Context) -> list[PatternMatch]:
                 elif target != cid and (shared_ifaces := sorted(a for a in anc & ctx.ancestors(target)
                                                                  if ctx.is_abstractish(a))) and (
                         "proxy" in cls.name.lower()
-                        or any(attr.name in m.attr_writes for m in cls.methods if m.name != "__init__")
+                        or any(attr.name in m.attr_writes for m in cls.methods if m.kind != "constructor")
                         or len(same_name) >= 2 and len(same_name) * 2 >= len(_public(cls.methods))):
                     # Proxy: same (abstract) interface as the real subject it creates or controls access to
                     shared = shared_ifaces[0]
-                    lazy = any(attr.name in m.attr_writes for m in cls.methods if m.name != "__init__")
+                    lazy = any(attr.name in m.attr_writes for m in cls.methods if m.kind != "constructor")
                     ev = [f"implements {ctx.name(shared)} like the real subject {ctx.name(target)} held in '{attr.name}'"]
                     if lazy:
                         ev.append("creates the real subject lazily on first use")
@@ -456,19 +513,18 @@ def detect_observer(ctx: Context) -> list[PatternMatch]:
         for attr in cls.attributes:
             if attr.kind != "field":
                 continue
-            collection = any(m == "*" for _, m in ctx.attr_targets(attr)) or \
-                (attr.type or "").split("[")[0].lower() in ("list", "set", "dict", "weakset", "defaultdict", "deque") \
-                or any(t in (attr.type or "") for t in ("List[", "Set[", "list[", "set[", "dict[", "Dict["))
+            collection = container(attr) is not None
             if not collection:
                 continue
             notifies = [m for m in cls.methods if attr.name in m.iterated_attrs and attr.name in m.attr_calls]
             adds = [m for m in cls.methods if attr.name in m.attr_calls and
-                    any(c in ("append", "add", "setdefault", "insert", "extend") for c in m.attr_calls[attr.name])
-                    and m.name != "__init__"]
+                    any(c in ADD_CALLS for c in m.attr_calls[attr.name])
+                    and m.kind != "constructor"]
             named = bool(OBSERVER_ATTR.search(attr.name))
             if not notifies and not (named and adds):
                 continue
-            if not (named or any(ADD_METHOD.match(m.name) for m in adds) or any(NOTIFY_METHOD.match(m.name) for m in notifies)):
+            if not (named or any(ADD_METHOD.match(norm(m.name)) for m in adds)
+                    or any(NOTIFY_METHOD.match(norm(m.name)) for m in notifies)):
                 continue
             parts = {cid: "Subject"}
             for target, _ in ctx.attr_targets(attr):
@@ -515,7 +571,7 @@ def detect_strategy_state(ctx: Context) -> list[PatternMatch]:
                     parts.setdefault(d, f"Concrete {role}")
                 ev = [f"'{attr.name}' holds an interchangeable {tcls.name} ({len(impls)} implementations)",
                       f"delegates via {', '.join(u + '()' for u in used[:3])}"]
-                if is_state and any(attr.name in m.attr_writes for m in cls.methods if m.name != "__init__"):
+                if is_state and any(attr.name in m.attr_writes for m in cls.methods if m.kind != "constructor"):
                     ev.append(f"transitions by reassigning '{attr.name}'")
                 conf = (0.85 if len(impls) >= 2 else 0.65) if ctx.is_abstractish(target) else 0.6
                 out.append(PatternMatch(key, parts, ev, conf))
@@ -552,7 +608,7 @@ def detect_command(ctx: Context) -> list[PatternMatch]:
     out = []
     bases_done: set[str] = set()
     for cid, cls in ctx.classes.items():
-        abstract_cmds = [m for m in cls.methods if m.name in COMMAND_METHODS and (m.is_abstract or m.is_stub)]
+        abstract_cmds = [m for m in cls.methods if norm(m.name) in COMMAND_METHODS and (m.is_abstract or m.is_stub)]
         impls = [d for d in ctx.descendants(cid)
                  if any(ctx.classes[d].method(m.name) for m in abstract_cmds)]
         if abstract_cmds and len(impls) >= 2:
@@ -574,7 +630,7 @@ def detect_command(ctx: Context) -> list[PatternMatch]:
     # Name-based families: ...Command classes with an execute-like method
     for cid, cls in ctx.classes.items():
         if cls.name.endswith("Command") and not any(cid in m.participants for m in out) \
-                and any(m.name in COMMAND_METHODS for m in cls.methods):
+                and any(norm(m.name) in COMMAND_METHODS for m in cls.methods):
             out.append(PatternMatch("command", {cid: "Command"}, ["name ends with 'Command' and is executable"], 0.6))
     return out
 
@@ -583,7 +639,7 @@ def detect_visitor(ctx: Context) -> list[PatternMatch]:
     out = []
     visitors: dict[str, ClassInfo] = {}
     for cid, cls in ctx.classes.items():
-        visits = [m for m in cls.methods if m.name.startswith("visit_") or m.name == "visit"]
+        visits = [m for m in cls.methods if norm(m.name).startswith("visit_") or norm(m.name) == "visit"]
         ext = any(b.rsplit(".", 1)[-1] in ("NodeVisitor", "NodeTransformer") for b in cls.bases)
         if len(visits) >= 2 or ext or (visits and any("register" in d or "singledispatch" in d for v in visits for d in v.decorators)):
             visitors[cid] = cls
@@ -597,7 +653,7 @@ def detect_visitor(ctx: Context) -> list[PatternMatch]:
             parts[d] = "Concrete Visitor"
         for e in elements:
             parts.setdefault(e, "Element")
-        n = len([m for m in cls.methods if m.name.startswith("visit")])
+        n = len([m for m in cls.methods if norm(m.name).startswith("visit")])
         ev = [f"{n} visit methods" if n else "extends ast.NodeVisitor"]
         if elements:
             ev.append(f"{len(elements)} elements implement accept(visitor)")
@@ -610,14 +666,32 @@ def detect_visitor(ctx: Context) -> list[PatternMatch]:
 
 def detect_iterator(ctx: Context) -> list[PatternMatch]:
     out = []
+    covered_iters: set[str] = set()
     for cid, cls in ctx.classes.items():
-        if cls.method("__next__") or cls.method("__anext__"):
+        python_style = cls.method("__next__") or cls.method("__anext__")
+        cpp_style = cls.method("operator++") and cls.method("operator*")
+        names = {norm(m.name) for m in cls.methods}
+        cursor_style = "next" in names and bool(names & {"valid", "has_next", "is_done", "done", "at_end", "more"}) \
+            and not ctx.ancestors(cid) & covered_iters
+        if python_style or cpp_style or cursor_style:
             parts = {cid: "Iterator"}
             for oid, other in ctx.classes.items():
-                it = other.method("__iter__")
-                if oid != cid and it and any(_resolve_call(ctx, other, c) == cid for c in it.calls):
-                    parts[oid] = "Aggregate"
-            out.append(PatternMatch("iterator", parts, ["implements __iter__/__next__ protocol"], 0.85))
+                for factory in filter(None, (other.method("__iter__"), other.method("begin"))):
+                    if oid != cid and (any(_resolve_call(ctx, other, c) == cid for c in factory.calls)
+                                       or any(r.target == cid for r in factory.ref_names)):
+                        parts[oid] = "Aggregate"
+            if cursor_style and not (python_style or cpp_style):
+                for d in ctx.descendants(cid):
+                    parts.setdefault(d, "Concrete Iterator")
+                for oid, other in ctx.classes.items():
+                    for m in other.methods:
+                        if norm(m.name) in ("new_iterator", "iterator", "create_iterator", "make_iterator") and \
+                                any(r.target == cid for r in m.ref_names) and oid not in parts:
+                            parts[oid] = "Aggregate"
+                covered_iters.add(cid)
+            ev = ("implements __iter__/__next__ protocol" if python_style else "defines operator++ and operator*"
+                  if cpp_style else "cursor interface: Next() with a validity check")
+            out.append(PatternMatch("iterator", parts, [ev], 0.85 if not cursor_style or cls.is_abstract else 0.7))
     return out
 
 
@@ -627,10 +701,10 @@ def detect_registry(ctx: Context) -> list[PatternMatch]:
         # Plugin discovery: a table filled by scanning subclasses, entry points or packages.
         discovered = False
         for a in cls.attributes:
-            if (a.type or a.default or "").split("[")[0].split("(")[0].lower() not in ("dict", "{}", "defaultdict"):
+            if container(a) != "map":
                 continue
             for m in cls.methods:
-                if a.name in m.attr_writes and m.name != "__init__":
+                if a.name in m.attr_writes and m.kind != "constructor":
                     finders = [c for c in m.calls if DISCOVERY_CALL.search(c)]
                     finder = min(finders, key=lambda c: (not re.search("subclass|entry_points", c, re.I), c),
                                  default=None)
@@ -644,14 +718,13 @@ def detect_registry(ctx: Context) -> list[PatternMatch]:
                 break
         if discovered:
             continue
-        reg_attrs = [a for a in cls.attributes if a.scope == "class" and
-                     ((a.type or "").split("[")[0].lower() in ("dict", "list", "set", "defaultdict")
-                      or (a.default or "").startswith(("{", "[", "dict(", "defaultdict(")))]
+        reg_attrs = [a for a in cls.attributes if a.scope == "class" and container(a) is not None]
         for a in reg_attrs:
             writers = [m for m in cls.methods if a.name in m.attr_writes or
-                       (a.name in m.class_attr_refs and (m.name.startswith(("register", "add")) or m.name == "__init_subclass__"))
-                       or (a.name in m.attr_calls and m.name.startswith("register"))]
-            if writers and (REGISTRY_ATTR.search(a.name) or any(w.name.startswith("register") or w.name == "__init_subclass__"
+                       (a.name in m.class_attr_refs and (norm(m.name).startswith(("register", "add"))
+                                                         or m.name == "__init_subclass__"))
+                       or (a.name in m.attr_calls and norm(m.name).startswith("register"))]
+            if writers and (REGISTRY_ATTR.search(a.name) or any(norm(w.name).startswith("register") or w.name == "__init_subclass__"
                                                                for w in writers)):
                 ev = [f"class-level table '{a.name}'", f"populated by {writers[0].name}()"]
                 if writers[0].name == "__init_subclass__":
@@ -674,12 +747,12 @@ def detect_idioms(ctx: Context) -> list[PatternMatch]:
                                     ["implements __enter__/__exit__" if "__enter__" in names else "implements __aenter__/__aexit__"],
                                     1.0))
         if cls.is_data:
-            kind = next(s for s in cls.stereotypes if s in ("dataclass", "namedtuple", "typeddict", "model", "attrs"))
+            kind = next(s for s in cls.stereotypes if s in ("dataclass", "namedtuple", "typeddict", "model", "attrs", "struct"))
             ev = [f"declared as {kind}"]
             if "frozen" in cls.stereotypes:
                 ev.append("immutable (frozen) value object")
             out.append(PatternMatch("data_class", {cid: "Value Object" if "frozen" in cls.stereotypes else "Data Class"}, ev, 1.0))
-        public = [m for m in cls.methods if not m.name.startswith("_") or m.name == "__call__"]
+        public = [m for m in cls.methods if (m.visibility == "public" and not m.special) or m.name == "__call__"]
         if ("protocol" in cls.stereotypes or (cls.is_abstract and public and all(m.is_abstract or m.is_stub for m in public))) \
                 and not [a for a in cls.attributes if a.scope == "instance" and a.kind == "field"]:
             impls = ctx.descendants(cid)

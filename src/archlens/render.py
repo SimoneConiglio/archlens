@@ -58,18 +58,24 @@ def _metrics(project: Project) -> dict[str, dict[str, int]]:
     return out
 
 
+def in_package(name: str, pkg: str) -> bool:
+    """Python packages use dotted names (``pkg.sub``), path-named modules use slashes (``src/geo``)."""
+    return name == pkg or name.startswith(pkg + ".") or name.startswith(pkg + "/")
+
+
 def _packages(modules: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Sub-packages that group classes from more than one module (the root package is the full diagram)."""
+    """Packages / directories grouping classes from several modules (one holding everything is the full diagram)."""
     names = {m["name"] for m in modules if m["is_package"]}
     by_name = {m["name"]: m for m in modules}
-    root = min(names, key=len) if names else None
+    with_classes = [m for m in modules if m["classes"]]
     out = []
     for pkg in sorted(names):
-        if pkg == root and "." not in pkg:
-            continue
-        members = [m for m in modules if m["name"] == pkg or m["name"].startswith(pkg + ".")]
+        members = [m for m in modules if in_package(m["name"], pkg)]
         n_classes = sum(len(m["classes"]) for m in members)
-        if n_classes and len([m for m in members if m["classes"]]) > 1:
+        holders = [m for m in members if m["classes"]]
+        if len(holders) == len(with_classes):
+            continue  # same as the full diagram
+        if n_classes and len(holders) > 1:
             out.append({"name": pkg, "docstring": by_name[pkg]["docstring"],
                         "modules": len(members), "classes": n_classes})
     return out
@@ -108,6 +114,7 @@ def build_model(project: Project, title: str | None = None) -> dict[str, Any]:
         "title": title or project.name,
         "version": __version__,
         "generated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "languages": sorted({c.language for c in project.classes.values()}) or ["python"],
     }
     data.pop("root", None)  # do not leak absolute local paths into the report
     return data
